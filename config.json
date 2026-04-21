@@ -1,0 +1,9 @@
+{
+  "name": "CorvusMiner",
+  "version": "1.0.0",
+  "description": "A XMRig mining plugin",
+  "navbar": {
+    "label": "CorvusMiner",
+    "icon": "fa-money-bill"
+  }
+}

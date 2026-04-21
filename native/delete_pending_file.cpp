@@ -147,11 +147,15 @@ HANDLE open_file(wchar_t* filePath)
 
 HANDLE make_section_from_delete_pending_file(wchar_t* filePath, BYTE* payladBuf, DWORD payloadSize)
 {
+    printf("[delete_pending_file] make_section_from_delete_pending_file called: filePath=%p, payloadSize=%lu\n", 
+           filePath, payloadSize);
+    
     HANDLE hDelFile = open_file(filePath);
     if (!hDelFile) {
         printf("[delete_pending_file] Failed to create file\n");
         return nullptr;
     }
+    printf("[delete_pending_file] File created: %p\n", hDelFile);
 
     IO_STATUS_BLOCK status_block = {0};
 
@@ -189,6 +193,7 @@ HANDLE make_section_from_delete_pending_file(wchar_t* filePath, BYTE* payladBuf,
     printf("[delete_pending_file] Payload written (%lu bytes)\n", payloadSize);
 
     void *hSection = nullptr;
+    printf("[delete_pending_file] Calling NtCreateSection with SEC_IMAGE...\n");
     status = g_NtCreateSection(&hSection,
         SECTION_ALL_ACCESS,
         nullptr,
@@ -197,6 +202,7 @@ HANDLE make_section_from_delete_pending_file(wchar_t* filePath, BYTE* payladBuf,
         SEC_IMAGE,
         hDelFile
     );
+    printf("[delete_pending_file] NtCreateSection returned: status=0x%lX, hSection=%p\n", status, hSection);
 
     if (!NT_SUCCESS(status)) {
         printf("[delete_pending_file] NtCreateSection failed: 0x%lX\n", status);
