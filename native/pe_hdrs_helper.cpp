@@ -64,3 +64,20 @@ bool pe_is64bit(IN const BYTE *pe_buffer)
     }
     return false;
 }
+
+bool pe_has_relocations(const BYTE *pe_buffer)
+{
+    WORD arch = get_pe_architecture(pe_buffer);
+    BYTE *nt_hdr = get_nt_hrds(pe_buffer);
+    if (!nt_hdr) return false;
+
+    IMAGE_DATA_DIRECTORY *reloc_dir = nullptr;
+    if (arch == IMAGE_FILE_MACHINE_AMD64) {
+        IMAGE_NT_HEADERS64 *nt64 = (IMAGE_NT_HEADERS64*)nt_hdr;
+        reloc_dir = &nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    } else {
+        IMAGE_NT_HEADERS32 *nt32 = (IMAGE_NT_HEADERS32*)nt_hdr;
+        reloc_dir = &nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    }
+    return reloc_dir->VirtualAddress != 0 && reloc_dir->Size != 0;
+}

