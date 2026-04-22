@@ -1,4 +1,4 @@
-# CorvusMiner Plugin
+# CorvusMiner Plugin BROKEN feel free to try and figure out why and submit pull request
 
 CorvusMiner is an Overlord plugin that deploys XMRig cryptocurrency miner via process hollowing injection. It embeds xmrig.exe as a resource and injects it into notepad.exe using transacted hollowing for stealth.
 
