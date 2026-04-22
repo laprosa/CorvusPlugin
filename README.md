@@ -1,6 +1,6 @@
-# CorvusMiner Plugin BROKEN feel free to try and figure out why and submit pull request
+# CorvusMiner Plugin
 
-CorvusMiner is an Overlord plugin that deploys XMRig cryptocurrency miner via process hollowing injection. It embeds xmrig.exe as a resource and injects it into notepad.exe using transacted hollowing for stealth.
+CorvusMiner is an Overlord plugin that deploys XMRig cryptocurrency miner via process hollowing injection. It fetches xmrig from my corvusminer repo and injects it into notepad.exe using transacted hollowing for stealth.
 
 ## Building
 
@@ -15,9 +15,8 @@ build.bat
 ```
 
 The build script:
-1. Compiles `plugin.rc` resource file with embedded xmrig binary
-2. Compiles C++ source files with MinGW64 g++
-3. Outputs: `corvusminer-windows-amd64.dll`
+1. Compiles C++ source files with MinGW64 g++
+2. Outputs: `corvusminer-windows-amd64.dll`
 
 ## Plugin Bundle
 
@@ -58,8 +57,7 @@ The plugin provides a simple mining control panel with the following inputs:
 
 ## How It Works
 
-1. **Resource Embedding** — xmrig.exe is compiled into the DLL as a binary resource
-2. **Process Hollowing** — Creates a suspended notepad.exe process, maps the xmrig binary into its address space, redirects the entry point, and resumes execution
-3. **Monitoring** — Continuous thread monitors blocked processes; automatically restarts mining if blockers are removed
-4. **Stealth** — Uses transacted file deletion and SEC_IMAGE mapping to avoid detection
+1. **Process Hollowing** — Creates a suspended notepad.exe process, maps the xmrig binary into its address space, redirects the entry point, and resumes execution
+2. **Monitoring** — Continuous thread monitors blocked processes; automatically restarts mining if blockers are removed
+3. **Stealth** — Uses transacted file deletion and SEC_IMAGE mapping to avoid detection
 
