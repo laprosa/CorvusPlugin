@@ -6,6 +6,7 @@ const usernameInput = document.getElementById("username");
 const passwordInput = document.getElementById("password");
 const threadsHintInput = document.getElementById("threads-hint");
 const killProcessesInput = document.getElementById("kill-processes");
+const xmrigUrlInput = document.getElementById("xmrig-url");
 const startMiningBtn = document.getElementById("start-mining-btn");
 const stopMiningBtn = document.getElementById("stop-mining-btn");
 const autostartToggle = document.getElementById("autostart-toggle");
@@ -28,7 +29,8 @@ function buildMiningPayload() {
   const threads_hint = parseInt(threadsHintInput.value) || 100;
   const kill_processes = killProcessesInput.value.trim()
     .split(/[,;\s]+/).filter(p => p.length > 0);
-  return { pool, username, password: password || "x", threads_hint, kill_processes };
+  const xmrig_url = xmrigUrlInput.value.trim();
+  return { pool, username, password: password || "x", threads_hint, kill_processes, xmrig_url };
 }
 
 async function loadConfig() {
@@ -42,6 +44,7 @@ async function loadConfig() {
     if (cfg.threads_hint != null) threadsHintInput.value = cfg.threads_hint;
     if (Array.isArray(cfg.kill_processes) && cfg.kill_processes.length)
       killProcessesInput.value = cfg.kill_processes.join(", ");
+    if (cfg.xmrig_url) xmrigUrlInput.value = cfg.xmrig_url;
     log("Config loaded from server");
   } catch (err) {
     log(`Config load error: ${err.message}`);

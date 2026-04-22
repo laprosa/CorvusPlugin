@@ -1,7 +1,0 @@
-// Resource file for embedding xmrig binary
-// To build:
-// 1. Place xmrig.exe in the native/ directory
-// 2. Compile: rc.exe /r /l 0x409 plugin.rc
-// 3. Link the resulting plugin.res with the plugin object
-
-101 RCDATA "xmrig.exe"
